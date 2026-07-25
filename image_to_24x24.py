@@ -49,6 +49,8 @@ class App(tk.Tk):
         self._preview_offset_x = 0  # 原图在画布中的偏移
         self._preview_offset_y = 0
         self._preview_draw_w = 0    # 原图在画布中的绘制尺寸
+        self._zoom = 1.0            # 用户缩放倍率（基于适应画布的基准）
+        self._base_scale = 1.0      # 适应画布的基准缩放
         self._preview_draw_h = 0
 
         # 网格布局参数（供鼠标事件使用）
@@ -98,14 +100,16 @@ class App(tk.Tk):
         paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
 
         # 左侧 - 原图预览
-        left = ttk.LabelFrame(paned, text="原图预览")
-        paned.add(left, weight=1)
+        self._left_label = ttk.LabelFrame(paned, text="原图预览  |  Ctrl+滚轮缩放  双击重置")
+        paned.add(self._left_label, weight=1)
 
-        self.preview_canvas = tk.Canvas(left, bg="#2b2b2b", highlightthickness=0)
+        self.preview_canvas = tk.Canvas(self._left_label, bg="#2b2b2b", highlightthickness=0)
         self.preview_canvas.pack(fill=tk.BOTH, expand=True)
         self.preview_canvas.bind("<Configure>", self._draw_preview)
         self.preview_canvas.bind("<Motion>", self._on_preview_motion)
         self.preview_canvas.bind("<Leave>", self._hide_tooltip)
+        self.preview_canvas.bind("<Control-MouseWheel>", self._on_preview_zoom)
+        self.preview_canvas.bind("<Double-Button-1>", self._reset_zoom)
 
         # 右侧 - 颜色网格
         right = ttk.LabelFrame(paned, text="像素颜色代码")
@@ -188,12 +192,15 @@ class App(tk.Tk):
         if cw < 10 or ch < 10:
             return
 
-        # 等比缩放原图以适应画布
+        # 计算适应画布的基准缩放
         margin = 16
         avail_w = cw - margin * 2
         avail_h = ch - margin * 2
         ow, oh = self._orig_w, self._orig_h
-        scale = min(avail_w / ow, avail_h / oh, 1.0)  # 不超过原图大小
+        self._base_scale = min(avail_w / ow, avail_h / oh, 1.0)
+
+        # 应用用户缩放
+        scale = self._base_scale * self._zoom
         draw_w = max(int(ow * scale), 1)
         draw_h = max(int(oh * scale), 1)
 
@@ -208,6 +215,14 @@ class App(tk.Tk):
         self._preview_draw_h = draw_h
 
         canvas.create_image(ox, oy, anchor=tk.NW, image=self.preview_photo)
+
+        # 显示缩放百分比
+        pct = self._zoom * 100
+        canvas.create_text(
+            cw - 8, ch - 8, anchor=tk.SE,
+            text=f"{pct:.0f}%", fill="#888888",
+            font=("Consolas", 9),
+        )
 
     # ── 颜色网格绘制 ──────────────────────────────────────────
     def _draw_grid(self, event=None):
@@ -322,6 +337,20 @@ class App(tk.Tk):
             self._show_tooltip(sx, sy, px, py)
         else:
             self._hide_tooltip()
+
+    def _on_preview_zoom(self, event):
+        """Ctrl+滚轮缩放原图预览"""
+        if not hasattr(self, '_original_image') or self._original_image is None:
+            return
+        # 每档缩放 1.15 倍
+        factor = 1.15 if event.delta > 0 else 1 / 1.15
+        self._zoom = max(0.1, min(self._zoom * factor, 20.0))
+        self._draw_preview()
+
+    def _reset_zoom(self, event=None):
+        """双击重置缩放"""
+        self._zoom = 1.0
+        self._draw_preview()
 
     def _on_preview_motion(self, event):
         """原图预览上的鼠标移动 → 映射到 24x24 像素"""
