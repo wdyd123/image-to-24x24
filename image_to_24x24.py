@@ -280,8 +280,25 @@ class App(tk.Tk):
             )
 
     # ── 鼠标悬浮提示 ─────────────────────────────────────────
+    def _position_tooltip(self, screen_x, screen_y):
+        """定位 tooltip 在鼠标右下方，防止超出屏幕"""
+        tx = screen_x + 16
+        ty = screen_y + 16
+        self._tooltip.update_idletasks()
+        tw, th = self._tooltip.winfo_reqwidth(), self._tooltip.winfo_reqheight()
+
+        sw = self._tooltip.winfo_screenwidth()
+        sh = self._tooltip.winfo_screenheight()
+        if tx + tw > sw:
+            tx = screen_x - tw - 8
+        if ty + th > sh:
+            ty = screen_y - th - 8
+
+        self._tooltip.geometry(f"+{tx}+{ty}")
+        self._tooltip.deiconify()
+
     def _show_tooltip(self, screen_x, screen_y, x, y):
-        """在鼠标位置显示颜色信息"""
+        """在鼠标位置显示 24x24 网格的颜色信息（右侧用）"""
         if not self.pixels:
             return
         if not (0 <= x < PIXEL_SIZE and 0 <= y < PIXEL_SIZE):
@@ -295,22 +312,7 @@ class App(tk.Tk):
         self._tip_label_rgb.config(text=f"RGB({r}, {g}, {b})")
         self._tip_color_bar.itemconfig(self._tip_bar_rect, fill=hex_code)
 
-        # 定位：鼠标右下方偏移
-        tx = screen_x + 16
-        ty = screen_y + 16
-        self._tooltip.update_idletasks()
-        tw, th = self._tooltip.winfo_reqwidth(), self._tooltip.winfo_reqheight()
-
-        # 防止超出屏幕
-        sw = self._tooltip.winfo_screenwidth()
-        sh = self._tooltip.winfo_screenheight()
-        if tx + tw > sw:
-            tx = screen_x - tw - 8
-        if ty + th > sh:
-            ty = screen_y - th - 8
-
-        self._tooltip.geometry(f"+{tx}+{ty}")
-        self._tooltip.deiconify()
+        self._position_tooltip(screen_x, screen_y)
 
     def _hide_tooltip(self, event=None):
         self._tooltip.withdraw()
@@ -353,7 +355,7 @@ class App(tk.Tk):
         self._draw_preview()
 
     def _on_preview_motion(self, event):
-        """原图预览上的鼠标移动 → 映射到 24x24 像素"""
+        """原图预览上的鼠标移动 → 显示原图实际像素颜色"""
         if not hasattr(self, '_original_image') or self._original_image is None:
             return
         ox = self._preview_offset_x
@@ -367,15 +369,25 @@ class App(tk.Tk):
             self._hide_tooltip()
             return
 
-        # 映射到 24x24 网格
-        px = int(gx / dw * PIXEL_SIZE)
-        py = int(gy / dh * PIXEL_SIZE)
-        px = min(px, PIXEL_SIZE - 1)
-        py = min(py, PIXEL_SIZE - 1)
+        # 计算原图中的实际像素坐标
+        img_x = int(gx / dw * self._orig_w)
+        img_y = int(gy / dh * self._orig_h)
+        img_x = min(img_x, self._orig_w - 1)
+        img_y = min(img_y, self._orig_h - 1)
 
+        # 获取原图该位置的实际颜色
+        r, g, b = self._original_image.getpixel((img_x, img_y))
+        hex_code = f"#{r:02X}{g:02X}{b:02X}"
+
+        # 显示原图像素信息
+        self._tip_label_hex.config(text=f"{hex_code}  ({img_x},{img_y})")
+        self._tip_label_rgb.config(text=f"RGB({r}, {g}, {b})")
+        self._tip_color_bar.itemconfig(self._tip_bar_rect, fill=hex_code)
+
+        # 定位 tooltip
         sx = self.preview_canvas.winfo_rootx() + event.x
         sy = self.preview_canvas.winfo_rooty() + event.y
-        self._show_tooltip(sx, sy, px, py)
+        self._position_tooltip(sx, sy)
 
     # ── 导出 ──────────────────────────────────────────────────
     def _export_codes(self):
