@@ -43,7 +43,13 @@ class App(tk.Tk):
 
         self.pixels = []          # 24x24 RGB 列表
         self.hex_codes = []       # 24x24 HEX 列表
-        self.preview_photo = None
+        self.preview_photo = None  # 原图 PhotoImage（适配画布大小）
+        self._orig_w = 0          # 原图尺寸
+        self._orig_h = 0
+        self._preview_offset_x = 0  # 原图在画布中的偏移
+        self._preview_offset_y = 0
+        self._preview_draw_w = 0    # 原图在画布中的绘制尺寸
+        self._preview_draw_h = 0
 
         # 网格布局参数（供鼠标事件使用）
         self._grid_margin_left = 0
@@ -91,8 +97,8 @@ class App(tk.Tk):
         paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
 
-        # 左侧 - 预览
-        left = ttk.LabelFrame(paned, text="预览 (24×24 放大)")
+        # 左侧 - 原图预览
+        left = ttk.LabelFrame(paned, text="原图预览")
         paned.add(left, weight=1)
 
         self.preview_canvas = tk.Canvas(left, bg="#2b2b2b", highlightthickness=0)
@@ -144,50 +150,64 @@ class App(tk.Tk):
             else:
                 return
 
+        # 保存原图尺寸
+        self._orig_w, self._orig_h = img.size
+
         # 缩放到 24x24
         resized = img.resize((PIXEL_SIZE, PIXEL_SIZE), Image.LANCZOS)
-        self._update_data(resized)
-        self.status_var.set(f"已加载 {os.path.basename(path)} ({w}×{h}) → 24×24")
+        self._update_data(resized, img)
+        self.status_var.set(f"已加载 {os.path.basename(path)} ({self._orig_w}×{self._orig_h}) → 24×24")
 
     # ── 数据处理 ──────────────────────────────────────────────
-    def _update_data(self, img: Image.Image):
+    def _update_data(self, resized: Image.Image, original: Image.Image):
         self.pixels = []
         self.hex_codes = []
         for y in range(PIXEL_SIZE):
             row_px = []
             row_hex = []
             for x in range(PIXEL_SIZE):
-                r, g, b = img.getpixel((x, y))
+                r, g, b = resized.getpixel((x, y))
                 row_px.append((r, g, b))
                 row_hex.append(f"#{r:02X}{g:02X}{b:02X}")
             self.pixels.append(row_px)
             self.hex_codes.append(row_hex)
 
-        self.preview_photo = ImageTk.PhotoImage(img.resize(
-            (PIXEL_SIZE * PREVIEW_SCALE, PIXEL_SIZE * PREVIEW_SCALE), Image.NEAREST
-        ))
+        # 保存原图用于左侧预览
+        self._original_image = original
+        self.preview_photo = None  # 将在 _draw_preview 中按需生成
         self._draw_preview()
         self._draw_grid()
 
-    # ── 预览绘制 ──────────────────────────────────────────────
+    # ── 预览绘制（原图） ──────────────────────────────────────
     def _draw_preview(self, event=None):
-        if not self.preview_photo:
+        if not hasattr(self, '_original_image') or self._original_image is None:
             return
         canvas = self.preview_canvas
         canvas.delete("all")
         cw, ch = canvas.winfo_width(), canvas.winfo_height()
         if cw < 10 or ch < 10:
             return
-        pw, ph = self.preview_photo.width(), self.preview_photo.height()
-        x = (cw - pw) // 2
-        y = (ch - ph) // 2
-        canvas.create_image(x, y, anchor=tk.NW, image=self.preview_photo)
 
-        # 画网格线
-        step = PREVIEW_SCALE
-        for i in range(PIXEL_SIZE + 1):
-            canvas.create_line(x + i * step, y, x + i * step, y + ph, fill="#555555")
-            canvas.create_line(x, y + i * step, x + pw, y + i * step, fill="#555555")
+        # 等比缩放原图以适应画布
+        margin = 16
+        avail_w = cw - margin * 2
+        avail_h = ch - margin * 2
+        ow, oh = self._orig_w, self._orig_h
+        scale = min(avail_w / ow, avail_h / oh, 1.0)  # 不超过原图大小
+        draw_w = max(int(ow * scale), 1)
+        draw_h = max(int(oh * scale), 1)
+
+        fitted = self._original_image.resize((draw_w, draw_h), Image.LANCZOS)
+        self.preview_photo = ImageTk.PhotoImage(fitted)
+
+        ox = (cw - draw_w) // 2
+        oy = (ch - draw_h) // 2
+        self._preview_offset_x = ox
+        self._preview_offset_y = oy
+        self._preview_draw_w = draw_w
+        self._preview_draw_h = draw_h
+
+        canvas.create_image(ox, oy, anchor=tk.NW, image=self.preview_photo)
 
     # ── 颜色网格绘制 ──────────────────────────────────────────
     def _draw_grid(self, event=None):
@@ -304,28 +324,29 @@ class App(tk.Tk):
             self._hide_tooltip()
 
     def _on_preview_motion(self, event):
-        """预览图上的鼠标移动"""
-        if not self.preview_photo:
+        """原图预览上的鼠标移动 → 映射到 24x24 像素"""
+        if not hasattr(self, '_original_image') or self._original_image is None:
             return
-        canvas = self.preview_canvas
-        cw, ch = canvas.winfo_width(), canvas.winfo_height()
-        pw, ph = self.preview_photo.width(), self.preview_photo.height()
-        ox = (cw - pw) // 2
-        oy = (ch - ph) // 2
+        ox = self._preview_offset_x
+        oy = self._preview_offset_y
+        dw = self._preview_draw_w
+        dh = self._preview_draw_h
 
         gx = event.x - ox
         gy = event.y - oy
-        if gx < 0 or gy < 0 or gx >= pw or gy >= ph:
+        if gx < 0 or gy < 0 or gx >= dw or gy >= dh:
             self._hide_tooltip()
             return
 
-        px, py = gx // PREVIEW_SCALE, gy // PREVIEW_SCALE
-        if 0 <= px < PIXEL_SIZE and 0 <= py < PIXEL_SIZE:
-            sx = canvas.winfo_rootx() + event.x
-            sy = canvas.winfo_rooty() + event.y
-            self._show_tooltip(sx, sy, px, py)
-        else:
-            self._hide_tooltip()
+        # 映射到 24x24 网格
+        px = int(gx / dw * PIXEL_SIZE)
+        py = int(gy / dh * PIXEL_SIZE)
+        px = min(px, PIXEL_SIZE - 1)
+        py = min(py, PIXEL_SIZE - 1)
+
+        sx = self.preview_canvas.winfo_rootx() + event.x
+        sy = self.preview_canvas.winfo_rooty() + event.y
+        self._show_tooltip(sx, sy, px, py)
 
     # ── 导出 ──────────────────────────────────────────────────
     def _export_codes(self):
