@@ -7,10 +7,31 @@
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from PIL import Image, ImageTk
+from PIL import Image, ImageEnhance, ImageTk
 import os
 import sys
 import ctypes
+import threading
+import numpy as np
+import urllib.request
+
+# ── ONNX Runtime（可选，用于 AI 超分转换） ──
+try:
+    import onnxruntime as ort
+    _HAS_ONNX = True
+except ImportError:
+    _HAS_ONNX = False
+
+# ── ESPCN 超分辨率模型配置 ──
+# ONNX Model Zoo - ESPCN (Efficient Sub-Pixel CNN) 超分模型
+_SR_MODEL_URL = (
+    "https://github.com/onnx/models/raw/refs/heads/main/"
+    "validated/vision/super_resolution/sub_pixel_cnn_2016/model/"
+    "super-resolution-10.onnx"
+)
+_SR_MODEL_DIR = os.path.join(os.path.expanduser("~"), ".cache", "img24x24")
+_SR_MODEL_PATH = os.path.join(_SR_MODEL_DIR, "super-resolution-10.onnx")
+_SR_INPUT_SIZE = 224   # 喂给 SR 模型的输入边长（越大细节越丰富）
 
 # ── Windows 高 DPI 感知（必须在创建任何 UI 之前调用） ──
 if sys.platform == "win32":
@@ -52,6 +73,7 @@ class App(tk.Tk):
         self._zoom = 1.0            # 用户缩放倍率（基于适应画布的基准）
         self._base_scale = 1.0      # 适应画布的基准缩放
         self._preview_draw_h = 0
+        self._ai_processing = False      # 处理中标志
 
         # 网格布局参数（供鼠标事件使用）
         self._grid_margin_left = 0
@@ -93,6 +115,7 @@ class App(tk.Tk):
         self.path_var = tk.StringVar(value="未选择图片")
         ttk.Label(toolbar, textvariable=self.path_var, foreground="gray").pack(side=tk.LEFT, padx=12)
 
+        ttk.Button(toolbar, text="AI 超分转换", command=self._ai_convert).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(toolbar, text="导出颜色代码", command=self._export_codes).pack(side=tk.RIGHT)
 
         # 主区域：左右分栏
@@ -127,6 +150,199 @@ class App(tk.Tk):
         # 底部状态栏
         self.status_var = tk.StringVar(value="请选择一张正方形图片")
         ttk.Label(self, textvariable=self.status_var, foreground="gray").pack(fill=tk.X, padx=8, pady=4)
+
+    # ── ONNX 超分模型管理 ────────────────────────────────────
+
+    @staticmethod
+    def _ensure_sr_model(status_cb=None) -> str:
+        """
+        确保 ESPCN 超分辨率 ONNX 模型已下载。
+        尝试用 onnx 库将输入改为动态尺寸以支持任意大小输入。
+        如果 onnx 库不可用，直接使用原始模型。
+        """
+        dynamic_path = _SR_MODEL_PATH.replace(".onnx", "_dynamic.onnx")
+        if os.path.isfile(dynamic_path):
+            return dynamic_path
+        if os.path.isfile(_SR_MODEL_PATH):
+            # 原始模型已下载，尝试转换为动态输入
+            return App._make_dynamic(_SR_MODEL_PATH, dynamic_path)
+
+        # 下载模型
+        os.makedirs(_SR_MODEL_DIR, exist_ok=True)
+        if status_cb:
+            status_cb("正在下载 ESPCN 超分模型（~1MB，仅首次）…")
+        urllib.request.urlretrieve(_SR_MODEL_URL, _SR_MODEL_PATH)
+        if status_cb:
+            status_cb("模型下载完成，正在准备…")
+        return App._make_dynamic(_SR_MODEL_PATH, dynamic_path)
+
+    @staticmethod
+    def _make_dynamic(src_path: str, dst_path: str) -> str:
+        """尝试将模型输入改为动态尺寸，失败则返回原路径"""
+        try:
+            import onnx
+            model = onnx.load(src_path)
+            for inp in model.graph.input:
+                shape = inp.type.tensor_type.shape
+                # 设 batch=1, channels 固定, H/W 动态
+                shape.dim[0].dim_value = 1
+                shape.dim[2].dim_param = "height"
+                shape.dim[3].dim_param = "width"
+            onnx.save(model, dst_path)
+            return dst_path
+        except Exception:
+            return src_path
+
+    # ── AI 超分降采样（ONNX Runtime + ESPCN） ────────────────
+
+    def _ai_downscale(self, img: Image.Image) -> Image.Image:
+        """
+        用 ESPCN 超分辨率神经网络主导的降采样。
+        核心思路：先缩到中等尺寸 → AI 超分辨率增强细节 → 缩到 24×24。
+        神经网络在超分阶段"智能重建"像素，保留语义信息。
+        """
+        # ── 加载 SR 模型 ──
+        model_path = self._ensure_sr_model(
+            lambda msg: self.after(0, lambda m=msg: self.status_var.set(m)))
+        self.after(0, lambda: self.status_var.set("AI 超分处理中…"))
+        self.after(0, self.update_idletasks)
+
+        sess = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+        input_name = sess.get_inputs()[0].name
+        input_shape = sess.get_inputs()[0].shape  # e.g. [1, 3, 'height', 'width']
+        out_name = sess.get_outputs()[0].name
+
+        # 确定模型期望的通道数和输入尺寸
+        n_channels = input_shape[1] if len(input_shape) > 1 and isinstance(input_shape[1], int) else 3
+        # 如果模型有固定输入尺寸，使用该尺寸；否则用 _SR_INPUT_SIZE
+        model_h = input_shape[2] if len(input_shape) > 2 and isinstance(input_shape[2], int) else _SR_INPUT_SIZE
+        model_w = input_shape[3] if len(input_shape) > 3 and isinstance(input_shape[3], int) else _SR_INPUT_SIZE
+
+        # ── Step 1: 将原图缩到模型输入尺寸 ──
+        # 选择足够大的中间尺寸以保留信息
+        sr_input = img.resize((model_w, model_h), Image.LANCZOS)
+
+        # ── Step 2: 预处理 ──
+        # ESPCN 模型接受 YCbCr 或 RGB，取决于模型通道数
+        if n_channels == 1:
+            # Y 通道（亮度）
+            ycbcr = sr_input.convert('YCbCr')
+            y_arr = np.array(ycbcr.split()[0], dtype=np.float32) / 255.0
+            input_tensor = y_arr[np.newaxis, np.newaxis, ...]  # (1, 1, H, W)
+        else:
+            # RGB 3 通道
+            img_arr = np.array(sr_input, dtype=np.float32) / 255.0
+            input_tensor = img_arr.transpose(2, 0, 1)[np.newaxis, ...]  # (1, 3, H, W)
+
+        input_tensor = input_tensor.astype(np.float32)
+
+        # ── Step 3: AI 超分推理 ──
+        self.after(0, lambda: self.status_var.set("神经网络推理中…"))
+        self.after(0, self.update_idletasks)
+
+        sr_output = sess.run([out_name], {input_name: input_tensor})[0]
+
+        # ── Step 4: 后处理输出 ──
+        out = sr_output[0]  # 去掉 batch 维
+        if out.ndim == 3:
+            if out.shape[0] == 1:
+                # (1, H, W) → Y 通道
+                y_out = (out[0].clip(0, 1) * 255).astype(np.uint8)
+                y_img = Image.fromarray(y_out, mode='L')
+                # 上采样 Cb, Cr 通道
+                sr_w, sr_h = y_img.size
+                cb = sr_input.convert('YCbCr').split()[1].resize((sr_w, sr_h), Image.BICUBIC)
+                cr = sr_input.convert('YCbCr').split()[2].resize((sr_w, sr_h), Image.BICUBIC)
+                result_img = Image.merge('YCbCr', [y_img, cb, cr]).convert('RGB')
+            elif out.shape[0] == 3:
+                # (3, H, W) → RGB
+                out_rgb = out.transpose(1, 2, 0)
+                result_img = Image.fromarray(
+                    (out_rgb.clip(0, 1) * 255).astype(np.uint8))
+            else:
+                # 其他格式，尝试按通道处理
+                out_rgb = out.transpose(1, 2, 0)
+                if out_rgb.shape[2] >= 3:
+                    result_img = Image.fromarray(
+                        (out_rgb[:, :, :3].clip(0, 1) * 255).astype(np.uint8))
+                else:
+                    result_img = Image.fromarray(
+                        (out_rgb[:, :, 0].clip(0, 1) * 255).astype(np.uint8), mode='L').convert('RGB')
+        else:
+            # 2D 输出
+            result_img = Image.fromarray(
+                (out.clip(0, 1) * 255).astype(np.uint8), mode='L').convert('RGB')
+
+        # ── Step 5: 缩放到目标 24×24 ──
+        # 用 Lanczos 从 AI 增强后的图像缩放到目标尺寸
+        result_img = result_img.resize((PIXEL_SIZE, PIXEL_SIZE), Image.LANCZOS)
+
+        # ── Step 6: 颜色校正 ──
+        # 匹配原图的色彩统计（确保 AI 不偏色）
+        result_arr = np.array(result_img, dtype=np.float32)
+        orig_24 = np.array(
+            img.resize((PIXEL_SIZE, PIXEL_SIZE), Image.LANCZOS),
+            dtype=np.float32)
+        for c in range(3):
+            src_mean = result_arr[:, :, c].mean()
+            src_std = result_arr[:, :, c].std() + 1e-6
+            ref_mean = orig_24[:, :, c].mean()
+            ref_std = orig_24[:, :, c].std() + 1e-6
+            # 70% 原图色彩 + 30% AI 增强色彩
+            result_arr[:, :, c] = (result_arr[:, :, c] - src_mean) * (
+                ref_std / src_std) * 0.7 + ref_mean * 0.7 + src_mean * 0.3
+
+        result_img = Image.fromarray(result_arr.clip(0, 255).astype(np.uint8))
+
+        # 轻微饱和度补偿
+        result_img = ImageEnhance.Color(result_img).enhance(1.08)
+
+        return result_img
+
+    def _ai_convert(self):
+        """AI 智能转换按钮回调（后台线程执行）"""
+        if self._ai_processing:
+            return
+        if not hasattr(self, '_original_image') or self._original_image is None:
+            messagebox.showinfo("提示", "请先选择图片")
+            return
+        if not _HAS_ONNX:
+            messagebox.showwarning(
+                "缺少依赖",
+                "AI 智能转换需要 ONNX Runtime，请运行：\n\n"
+                "pip install onnxruntime\n\n"
+                "安装后重启程序即可使用。\n"
+                "（仅 ~6MB，远小于 PyTorch）"
+            )
+            return
+
+        self._ai_processing = True
+        self.status_var.set("AI 正在分析图像，请稍候…")
+        self.update_idletasks()
+
+        original = self._original_image.copy()
+
+        def _worker():
+            try:
+                resized = self._ai_downscale(original)
+                self.after(0, lambda: self._on_ai_done(resized, original))
+            except Exception as e:
+                self.after(0, lambda: self._on_ai_error(str(e)))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_ai_done(self, resized: Image.Image, original: Image.Image):
+        """处理完成回调（主线程）"""
+        self._ai_processing = False
+        self._update_data(resized, original)
+        self.status_var.set(
+            f"AI 智能转换完成 {self._orig_w}×{self._orig_h} → 24×24")
+
+    def _on_ai_error(self, err: str):
+        """处理出错回调（主线程）"""
+        self._ai_processing = False
+        self.status_var.set("AI 处理失败")
+        messagebox.showerror("AI 处理错误", f"处理过程中出错：\n{err}")
 
     # ── 文件选择 ──────────────────────────────────────────────
     def _open_file(self):
