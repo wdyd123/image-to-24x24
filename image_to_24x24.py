@@ -7,9 +7,10 @@
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from PIL import Image, ImageEnhance, ImageTk
+from PIL import Image, ImageEnhance, ImageFilter, ImageTk
 import os
 import sys
+import json
 import ctypes
 import threading
 import numpy as np
@@ -49,6 +50,172 @@ PIXEL_SIZE = 24          # 目标像素数
 PREVIEW_SCALE = 16       # 预览放大倍数
 CELL_SIZE = 28           # 颜色网格中每格像素大小
 
+# ── 调色板颜色（从色块图片自动提取） ──
+# 暖色调色板（6行×4列 = 24色）+ 冷色调色板（4行×4列 = 16色）
+PALETTE_COLORS = [
+    # ── 暖色调色板 ──
+    # Row 1: 黑 / 灰 / 白系
+    (34, 34, 34),         # #222222 深灰黑
+    (180, 180, 180),      # #B4B4B4 浅灰
+    (234, 231, 223),      # #EAE7DF 米白
+    (255, 255, 255),      # #FFFFFF 纯白
+    # Row 2: 红 / 品红系
+    (211, 47, 54),        # #D32F36 红
+    (156, 10, 0),         # #9C0A00 暗红
+    (214, 12, 74),        # #D60C4A 品红
+    (230, 150, 141),      # #E6968D 浅粉
+    # Row 3: 珊瑚 / 粉色系
+    (254, 152, 117),      # #FE9875 珊瑚
+    (247, 208, 192),      # #F7D0C0 淡粉
+    (252, 239, 234),      # #FCEFEA 极淡粉
+    (251, 246, 232),      # #FBF6E8 奶白
+    # Row 4: 米色 / 棕色系
+    (220, 210, 200),      # #DCD2C8 浅米
+    (226, 206, 171),      # #E2CEAB 棕褐
+    (213, 99, 34),        # #D56322 焦橙
+    (212, 140, 66),       # #D48C42 浅棕
+    # Row 5: 橙 / 黄系
+    (242, 153, 0),        # #F29900 橙
+    (249, 201, 51),       # #F9C933 金黄
+    (252, 228, 153),      # #FCE499 淡黄
+    (179, 180, 122),      # #B3B47A 橄榄卡其
+    # Row 6: 绿色 / 褐色系
+    (194, 218, 114),      # #C2DA72 浅绿
+    (105, 106, 10),       # #696A0A 深橄榄绿
+    (166, 138, 85),       # #A68A55 深金棕
+    (169, 143, 116),      # #A98F74 灰褐
+    # ── 冷色调色板 ──
+    # Row 1: 橄榄 / 棕色系
+    (170, 146, 40),       # #AA9228 橄榄金
+    (63, 43, 18),         # #3F2B12 深棕
+    (116, 73, 31),        # #74491F 焦棕
+    (83, 70, 88),         # #534658 灰紫
+    # Row 2: 深蓝 / 紫色系
+    (40, 35, 67),         # #282343 深蓝
+    (57, 69, 153),        # #394599 宝蓝
+    (90, 69, 157),        # #5A459D 中紫
+    (186, 163, 215),      # #BAA3D7 薰衣草
+    # Row 3: 淡紫 / 蓝灰系
+    (182, 188, 223),      # #B6BCDF 淡薰衣草
+    (169, 172, 190),      # #A9ACBE 蓝灰
+    (99, 171, 185),       # #63ABB9 青蓝
+    (180, 210, 220),      # #B4D2DC 淡天蓝
+    # Row 4: 天蓝 / 青绿色系
+    (145, 216, 230),      # #91D8E6 天蓝
+    (71, 174, 160),       # #47AEA0 海绿
+    (182, 211, 200),      # #B6D3C8 薄荷
+    (39, 56, 100),        # #273864 深海军蓝
+]
+
+
+class GifFrameSelector(tk.Toplevel):
+    """GIF 动画帧可视化选择器：缩略图网格 + 翻页"""
+
+    COLS = 8
+    PAGE_SIZE = 40  # 每页最多显示 40 帧
+
+    def __init__(self, parent, img, n_frames):
+        super().__init__(parent)
+        self.title("选择帧")
+        self.transient(parent)
+        self.grab_set()
+
+        self.img = img
+        self.n_frames = n_frames
+        self.selected_frame = 0
+        self._page = 0
+        self._thumbs: list[ImageTk.PhotoImage] = []
+        self._buttons: list[tk.Button] = []
+
+        self._build_ui()
+        self._load_page()
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.wait_window()
+
+    def _build_ui(self):
+        top = ttk.Frame(self, padding=8)
+        top.pack(fill=tk.X)
+        ttk.Label(top, text=f"共 {self.n_frames} 帧 — 点击选择").pack(side=tk.LEFT)
+        self._page_label = ttk.Label(top, text="")
+        self._page_label.pack(side=tk.RIGHT)
+
+        nav = ttk.Frame(self, padding=4)
+        nav.pack(fill=tk.X)
+        self._prev_btn = ttk.Button(nav, text="◄ 上一页", command=self._go_prev)
+        self._prev_btn.pack(side=tk.LEFT)
+        self._next_btn = ttk.Button(nav, text="下一页 ►", command=self._go_next)
+        self._next_btn.pack(side=tk.RIGHT)
+
+        self._grid_frame = ttk.Frame(self)
+        self._grid_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        bot = ttk.Frame(self, padding=8)
+        bot.pack(fill=tk.X)
+        ttk.Button(bot, text="取消", command=self._cancel).pack(side=tk.RIGHT)
+
+    def _total_pages(self):
+        return max(1, (self.n_frames + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+
+    def _load_page(self):
+        for w in self._grid_frame.winfo_children():
+            w.destroy()
+        self._thumbs.clear()
+        self._buttons.clear()
+
+        start = self._page * self.PAGE_SIZE
+        end = min(start + self.PAGE_SIZE, self.n_frames)
+        tp = self._total_pages()
+        self._page_label.config(text=f"第 {self._page + 1}/{tp} 页")
+        self._prev_btn.config(state=tk.NORMAL if self._page > 0 else tk.DISABLED)
+        self._next_btn.config(state=tk.NORMAL if self._page < tp - 1 else tk.DISABLED)
+
+        # 记住当前帧位置，结束后恢复
+        orig_frame = self.img.tell()
+
+        try:
+            for i in range(start, end):
+                self.img.seek(i)
+                thumb_img = self.img.convert("RGBA")
+                bg = Image.new("RGBA", thumb_img.size, (255, 255, 255, 255))
+                bg.paste(thumb_img, mask=thumb_img.split()[3])
+                thumb_img = bg.convert("RGB").resize((48, 48), Image.NEAREST)
+                photo = ImageTk.PhotoImage(thumb_img)
+                self._thumbs.append(photo)
+
+                row, col = divmod(i - start, self.COLS)
+                btn = tk.Button(
+                    self._grid_frame, image=photo,
+                    command=lambda idx=i: self._select(idx),
+                    relief=tk.FLAT, padx=2, pady=2,
+                )
+                btn.grid(row=row, column=col, padx=3, pady=3)
+                # 帧编号标签
+                lbl = ttk.Label(self._grid_frame, text=str(i + 1),
+                                font=("Consolas", 7))
+                lbl.grid(row=row + 1, column=col)
+                self._buttons.append(btn)
+        finally:
+            self.img.seek(orig_frame)
+
+    def _go_prev(self):
+        if self._page > 0:
+            self._page -= 1
+            self._load_page()
+
+    def _go_next(self):
+        if self._page < self._total_pages() - 1:
+            self._page += 1
+            self._load_page()
+
+    def _select(self, idx):
+        self.selected_frame = idx
+        self.destroy()
+
+    def _cancel(self):
+        self.selected_frame = -1
+        self.destroy()
+
 
 class App(tk.Tk):
     def __init__(self):
@@ -74,6 +241,11 @@ class App(tk.Tk):
         self._base_scale = 1.0      # 适应画布的基准缩放
         self._preview_draw_h = 0
         self._ai_processing = False      # 处理中标志
+        self._downscale_mode = tk.StringVar(value="标准")
+
+        # 调色板限制
+        self._palette_snap_enabled = False
+        self._resized_image_orig = None  # 未吸附调色板的原始 24×24 图像
 
         # 网格布局参数（供鼠标事件使用）
         self._grid_margin_left = 0
@@ -116,7 +288,17 @@ class App(tk.Tk):
         ttk.Label(toolbar, textvariable=self.path_var, foreground="gray").pack(side=tk.LEFT, padx=12)
 
         ttk.Button(toolbar, text="AI 超分转换", command=self._ai_convert).pack(side=tk.LEFT, padx=(8, 0))
+        self._mode_combo = ttk.Combobox(toolbar, textvariable=self._downscale_mode,
+                                         values=["标准", "边缘增强", "主色量化", "增强+主色"],
+                                         state="readonly", width=10)
+        self._mode_combo.pack(side=tk.LEFT, padx=(8, 0))
+        self._mode_combo.bind("<<ComboboxSelected>>", self._on_mode_change)
+        self._palette_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(toolbar, text="调色板限制", variable=self._palette_var,
+                         command=self._on_palette_toggle).pack(side=tk.LEFT, padx=(16, 0))
         ttk.Button(toolbar, text="导出颜色代码", command=self._export_codes).pack(side=tk.RIGHT)
+        ttk.Button(toolbar, text="导出24×24图片", command=self._export_image).pack(side=tk.RIGHT, padx=(0, 8))
+        ttk.Button(toolbar, text="导出方舟数据", command=self._export_ark_json).pack(side=tk.RIGHT, padx=(0, 8))
 
         # 主区域：左右分栏
         paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
@@ -273,9 +455,8 @@ class App(tk.Tk):
             result_img = Image.fromarray(
                 (out.clip(0, 1) * 255).astype(np.uint8), mode='L').convert('RGB')
 
-        # ── Step 5: 缩放到目标 24×24 ──
-        # 用 Lanczos 从 AI 增强后的图像缩放到目标尺寸
-        result_img = result_img.resize((PIXEL_SIZE, PIXEL_SIZE), Image.LANCZOS)
+        # ── Step 5: 智能降采样到目标 24×24 ──
+        result_img = self._smart_downscale(result_img)
 
         # ── Step 6: 颜色校正 ──
         # 匹配原图的色彩统计（确保 AI 不偏色）
@@ -358,7 +539,30 @@ class App(tk.Tk):
 
         self.path_var.set(path)
         try:
-            img = Image.open(path).convert("RGB")
+            img = Image.open(path)
+
+            # ── 动画帧选择（GIF 等多帧图片） ──
+            n_frames = getattr(img, "n_frames", 1)
+            if n_frames > 1:
+                selector = GifFrameSelector(self, img, n_frames)
+                if selector.selected_frame < 0:
+                    return  # 用户取消
+                img.seek(selector.selected_frame)
+
+            # 所有图片都垫白色底层（处理透明/半透明/调色板模式）
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            if img.mode == "RGBA":
+                bg.paste(img, mask=img.split()[3])
+            elif img.mode in ("P", "PA"):
+                # 调色板模式可能含透明索引，先转 RGBA
+                img = img.convert("RGBA")
+                bg.paste(img, mask=img.split()[3])
+            elif img.mode == "LA":
+                img = img.convert("RGBA")
+                bg.paste(img, mask=img.split()[3])
+            else:
+                bg.paste(img.convert("RGB"))
+            img = bg
         except Exception as e:
             messagebox.showerror("错误", f"无法打开图片:\n{e}")
             return
@@ -373,13 +577,21 @@ class App(tk.Tk):
         # 保存原图尺寸
         self._orig_w, self._orig_h = img.size
 
-        # 缩放到 24x24
-        resized = img.resize((PIXEL_SIZE, PIXEL_SIZE), Image.LANCZOS)
+        # 智能降采样到 24x24
+        resized = self._smart_downscale(img)
         self._update_data(resized, img)
-        self.status_var.set(f"已加载 {os.path.basename(path)} ({self._orig_w}×{self._orig_h}) → 24×24")
+        self.status_var.set(f"已加载 {os.path.basename(path)} ({self._orig_w}×{self._orig_h}) → 24×24  [{self._downscale_mode.get()}]")
 
     # ── 数据处理 ──────────────────────────────────────────────
     def _update_data(self, resized: Image.Image, original: Image.Image):
+        # 保存未吸附调色板的原始 24×24 图像（用于关闭时恢复）
+        self._resized_image_orig = resized.copy()
+
+        # 若调色板限制已开启，吸附到调色板
+        if self._palette_snap_enabled:
+            resized = self._snap_to_palette(resized)
+
+        self._resized_image = resized
         self.pixels = []
         self.hex_codes = []
         for y in range(PIXEL_SIZE):
@@ -396,6 +608,118 @@ class App(tk.Tk):
         self._original_image = original
         self.preview_photo = None  # 将在 _draw_preview 中按需生成
         self._draw_preview()
+        self._draw_grid()
+
+    # ── 智能降采样 ─────────────────────────────────────────────
+    def _smart_downscale(self, img: Image.Image) -> Image.Image:
+        """根据当前降采样模式将图像缩放到 24×24"""
+        mode = self._downscale_mode.get()
+        if mode == "标准":
+            return img.resize((PIXEL_SIZE, PIXEL_SIZE), Image.LANCZOS)
+        enhanced = img
+        if "增强" in mode:
+            enhanced = self._edge_enhance(img)
+        if "主色" in mode:
+            return self._dominant_color(enhanced)
+        return enhanced.resize((PIXEL_SIZE, PIXEL_SIZE), Image.LANCZOS)
+
+    @staticmethod
+    def _edge_enhance(img: Image.Image) -> Image.Image:
+        """灰度边缘引导的轮廓增强（保留色相）"""
+        # 1. Unsharp mask 锐化
+        sharpened = img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+        # 2. 灰度 Sobel 边缘检测
+        gray = img.convert('L')
+        edges = gray.filter(ImageFilter.FIND_EDGES)
+        # 3. 将边缘信息转回 RGB 并叠加
+        edges_rgb = edges.convert('RGB')
+        base_arr = np.array(sharpened, dtype=np.float32)
+        edge_arr = np.array(edges_rgb, dtype=np.float32)
+        edge_weight = np.mean(edge_arr, axis=2, keepdims=True) / 255.0
+        blend = (base_arr * (1 - edge_weight * 0.25) + edge_arr * edge_weight * 0.25)
+        result = Image.fromarray(blend.clip(0, 255).astype(np.uint8))
+        # 4. 轻微锐化保持清晰
+        result = ImageEnhance.Sharpness(result).enhance(1.2)
+        return result
+
+    @staticmethod
+    def _dominant_color(img: Image.Image) -> Image.Image:
+        """主色量化：每个目标像素取源区域内出现次数最多的颜色"""
+        arr = np.array(img)
+        h, w, _ = arr.shape
+        target = PIXEL_SIZE
+        result = np.zeros((target, target, 3), dtype=np.uint8)
+        for ty in range(target):
+            for tx in range(target):
+                y0 = ty * h // target
+                y1 = (ty + 1) * h // target
+                x0 = tx * w // target
+                x1 = (tx + 1) * w // target
+                region = arr[y0:y1, x0:x1].reshape(-1, 3)
+                if region.size == 0:
+                    continue
+                # 量化为 32 级以合并相近颜色，再找众数
+                quantized = (region // 8) * 8 + 4
+                counts = {}
+                for pixel in quantized:
+                    key = (int(pixel[0]), int(pixel[1]), int(pixel[2]))
+                    counts[key] = counts.get(key, 0) + 1
+                dominant_q = max(counts, key=counts.get)
+                # 从原始像素中取该量化桶的平均色（更精确）
+                mask = np.all(quantized == np.array(dominant_q), axis=1)
+                result[ty, tx] = region[mask].mean(axis=0).round().astype(np.uint8)
+        return Image.fromarray(result)
+
+    def _on_mode_change(self, _event=None):
+        """降采样模式切换时重新处理图像"""
+        if not hasattr(self, '_original_image') or self._original_image is None:
+            return
+        resized = self._smart_downscale(self._original_image)
+        self._update_data(resized, self._original_image)
+        self.status_var.set(f"已切换降采样模式: {self._downscale_mode.get()} → 24×24")
+
+    # ── 调色板吸附 ────────────────────────────────────────────
+    @staticmethod
+    def _snap_to_palette(img: Image.Image) -> Image.Image:
+        """将图像中每个像素吸附到调色板中最近的颜色（加权 RGB 距离）"""
+        palette = np.array(PALETTE_COLORS, dtype=np.float32)
+        arr = np.array(img, dtype=np.float32)
+        h, w, _ = arr.shape
+        flat = arr.reshape(-1, 3)                       # (576, 3)
+        # 加权 RGB 距离（模拟人眼亮度感知 R:0.299 G:0.587 B:0.114）
+        weights = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+        diff = flat[:, np.newaxis, :] - palette[np.newaxis, :, :]  # (576, N, 3)
+        dist_sq = np.sum(weights * diff ** 2, axis=2)   # (576, N)
+        indices = np.argmin(dist_sq, axis=1)             # (576,)
+        snapped = palette[indices].reshape(h, w, 3).astype(np.uint8)
+        return Image.fromarray(snapped)
+
+    def _on_palette_toggle(self):
+        """调色板限制开关切换"""
+        self._palette_snap_enabled = self._palette_var.get()
+        if self._resized_image_orig is None:
+            return
+
+        if self._palette_snap_enabled:
+            self._resized_image = self._snap_to_palette(self._resized_image_orig)
+            self.status_var.set("调色板限制已开启 — 像素已吸附到调色板颜色")
+        else:
+            self._resized_image = self._resized_image_orig.copy()
+            self.status_var.set("调色板限制已关闭 — 恢复原始颜色")
+
+        # 从当前 _resized_image 重建 pixels / hex_codes 并刷新网格
+        self.pixels = []
+        self.hex_codes = []
+        img = self._resized_image
+        for y in range(PIXEL_SIZE):
+            row_px = []
+            row_hex = []
+            for x in range(PIXEL_SIZE):
+                r, g, b = img.getpixel((x, y))
+                row_px.append((r, g, b))
+                row_hex.append(f"#{r:02X}{g:02X}{b:02X}")
+            self.pixels.append(row_px)
+            self.hex_codes.append(row_hex)
         self._draw_grid()
 
     # ── 预览绘制（原图） ──────────────────────────────────────
@@ -605,6 +929,32 @@ class App(tk.Tk):
         sy = self.preview_canvas.winfo_rooty() + event.y
         self._position_tooltip(sx, sy)
 
+    # ── 导出24×24图片 ──────────────────────────────────────────
+    def _export_image(self):
+        if not hasattr(self, '_resized_image') or self._resized_image is None:
+            messagebox.showinfo("提示", "请先选择图片")
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="导出24×24图片",
+            defaultextension=".png",
+            filetypes=[
+                ("PNG 图片", "*.png"),
+                ("BMP 图片", "*.bmp"),
+                ("JPEG 图片", "*.jpg"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        try:
+            self._resized_image.save(path)
+            self.status_var.set(f"24×24 图片已导出到: {path}")
+            messagebox.showinfo("完成", f"24×24 图片已保存到:\n{path}")
+        except Exception as e:
+            messagebox.showerror("导出失败", f"保存图片时出错:\n{e}")
+
     # ── 导出 ──────────────────────────────────────────────────
     def _export_codes(self):
         if not self.hex_codes:
@@ -645,6 +995,43 @@ class App(tk.Tk):
 
         self.status_var.set(f"颜色代码已导出到: {path}")
         messagebox.showinfo("完成", f"颜色代码已保存到:\n{path}")
+
+    # ── 导出方舟数据 ────────────────────────────────────────────
+    def _export_ark_json(self):
+        """导出 24x24 像素数据为 JSON（供 ark_draw.py 自动绘制使用）"""
+        if not self.pixels:
+            messagebox.showinfo("提示", "请先选择图片")
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="导出方舟绘制数据",
+            defaultextension=".json",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+
+        # 扁平化 576 个像素 [r, g, b]
+        flat_pixels = []
+        for row in self.pixels:
+            for r, g, b in row:
+                flat_pixels.append([r, g, b])
+
+        data = {
+            "size": PIXEL_SIZE,
+            "pixels": flat_pixels,
+        }
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self.status_var.set(f"方舟绘制数据已导出到: {path}")
+            messagebox.showinfo("完成", f"方舟绘制数据已保存到:\n{path}\n\n"
+                                f"使用方式:\n"
+                                f"  以管理员身份运行终端\n"
+                                f"  python ark_draw.py \"{path}\"")
+        except Exception as e:
+            messagebox.showerror("导出失败", f"保存 JSON 时出错:\n{e}")
 
 
 if __name__ == "__main__":
